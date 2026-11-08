@@ -1,5 +1,6 @@
 """업로드한 정답 PDF와 OMR을 읽고, Python으로 채점합니다."""
 from io import BytesIO
+import base64
 import json
 import re
 import unicodedata
@@ -8,6 +9,8 @@ import pandas as pd
 import pdfplumber
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+ENGINE_VERSION = "2026-11-08-factual-grading-1"
 
 
 def choice_number(value):
@@ -77,6 +80,8 @@ def read_omr(file_bytes, filename, question_numbers):
         raise ValueError("학생 이름/번호가 비어 있거나 중복됩니다. 고유한 학생 식별자를 사용하세요.")
     columns = {}
     for col in df.columns:
+        if re.fullmatch(r"(?:[Qq]|문항)\s*0*\d+(?:\s*번)?\.\d+", str(col).strip()):
+            raise ValueError(f"OMR 응답 열이 중복되었거나 문항 번호가 잘못되었습니다: {col}")
         match = re.fullmatch(r"(?:[Qq]\s*0*|문항\s*0*)?(\d+)(?:\s*번)?", str(col).strip())
         if match:
             number = int(match.group(1))
@@ -103,35 +108,84 @@ def read_omr(file_bytes, filename, question_numbers):
 def read_exam(pdf_bytes):
     """2단 시험지를 열별로 읽고, 공통 지문도 해당 문항과 함께 보존합니다."""
     questions = {}
+    shared = ""
+    shared_start = shared_end = 0
+    shared_started = False
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
             for left, right in [(0, page.width / 2), (page.width / 2, page.width)]:
-                text = page.crop((left, 0, right, page.height)).extract_text() or ""
+                column = page.crop((left, 0, right, page.height))
+                text = column.extract_text() or ""
+                text = text.split("* 확인 사항")[0]
+                text = re.sub(r"(?m)^.*이 문제지에 관한 저작권.*$", "", text)
                 markers = list(re.finditer(r"(?m)^\s*(\d{1,3})\.\s|\[(\d{1,3})\s*[~～∼–-]\s*(\d{1,3})\]", text))
-                shared = ""
-                shared_end = 0
+                # 공통 지문이 다음 열까지 이어지면 첫 문항 전의 나머지 본문도 붙입니다.
+                if shared and not shared_started and markers and markers[0].group(1):
+                    first = int(markers[0].group(1))
+                    if shared_start <= first <= shared_end:
+                        shared += "\n" + text[:markers[0].start()].strip()
                 for i, match in enumerate(markers):
                     end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
                     section = text[match.start():end].strip()
                     if match.group(2):
                         shared = section
+                        shared_start = int(match.group(2))
                         shared_end = int(match.group(3))
+                        shared_started = False
                         continue
                     number = int(match.group(1))
+                    if number in questions:
+                        raise ValueError(f"문제지에 {number}번 문항이 중복됩니다. 같은 페이지나 다른 시험이 섞이지 않았는지 확인해 주세요.")
                     if number > shared_end:
                         shared = ""
+                    shared_started = True
                     questions[number] = {"page": page_num, "text": (shared + "\n" + section).strip()}
+                    # 그림·도표 문항은 원본을 바꾸지 않고 메모리에서만 참조용 이미지를 읽습니다.
+                    if re.search(r"그림|도표|표를", section[:130]):
+                        words = column.extract_words()
+                        starts = [w["top"] for w in words if w["text"] == f"{number}."]
+                        next_number = next((int(m.group(1)) for m in markers[i+1:] if m.group(1)), None)
+                        ends = [w["top"] for w in words if next_number and w["text"] == f"{next_number}."]
+                        top = max(0, min(starts) - 3) if starts else 0
+                        bottom = min(ends) - 3 if ends else page.height - 20
+                        image = page.crop((left, top, right, max(top + 1, bottom))).to_image(resolution=200).original
+                        buffer = BytesIO(); image.save(buffer, format="PNG")
+                        questions[number]["image_url"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
     if not questions:
         raise ValueError("문제 PDF에서 문항을 읽지 못했습니다. 텍스트를 선택할 수 있는 PDF를 사용하세요.")
     return questions
 
 
-def analyze(exam_bytes, answer_bytes, omr_bytes, omr_name):
+def file_warnings(exam_bytes, answer_bytes, exam_name="", answer_name=""):
+    def identity(data, name):
+        with pdfplumber.open(BytesIO(data)) as pdf:
+            heading=(pdf.pages[0].extract_text() or '')[:1800]
+        heading=re.sub(r'\s+','',heading)
+        year=re.search(r'(20\d{2})학년도',heading)
+        form=re.search(r'(홀수|짝수)\)?형',heading)
+        subject_heading=heading[:300].replace('대학수학능력시험','')
+        subject_name=name.replace('대학수학능력시험','')
+        subject=next((s for s in ['영어','국어','수학','한국사'] if s in subject_heading or s in subject_name),None)
+        exam_type=next((t for t in ['대학수학능력시험','전국연합학력평가','모의평가','학업성취도평가'] if t in heading[:400] or t in name),None)
+        return {'학년도':year.group(1) if year else None,'시험형':form.group(1) if form else None,'과목':subject,'시험명':exam_type}
+    exam,answer=identity(exam_bytes,exam_name),identity(answer_bytes,answer_name)
+    warnings=[]
+    for label in exam:
+        if exam[label] and answer[label] and exam[label]!=answer[label]:
+            warnings.append(f"문제지와 정답표의 {label} 표기가 다릅니다(문제지: {exam[label]}, 정답표: {answer[label]}). 동일 시험인지 확인하세요. 문항 수가 같아 계산은 진행했지만 결과가 잘못될 수 있습니다.")
+    warnings.append("문항 번호 일치는 검사했지만, OMR에 시험명·학년도 식별 정보가 없어 동일 시험의 응답인지까지 확인할 수는 없습니다. 업로드한 원본 시험을 확인하세요.")
+    return warnings
+
+
+def analyze(exam_bytes, answer_bytes, omr_bytes, omr_name, exam_name="", answer_name=""):
     key = read_answer_key(answer_bytes)
     names, responses = read_omr(omr_bytes, omr_name, key)
     questions = read_exam(exam_bytes)
-    if set(key) - set(questions):
-        raise ValueError(f"문제지에서 다음 문항을 찾지 못했습니다: {sorted(set(key) - set(questions))}")
+    if set(key) != set(questions):
+        raise ValueError(f"채점을 중단했습니다. 문제지 {len(questions)}문항과 정답표 {len(key)}문항의 번호가 다릅니다. "
+                         f"본문을 읽지 못한 번호: {sorted(set(key)-set(questions))}, 정답이 없는 번호: {sorted(set(questions)-set(key))}. "
+                         "다른 시험·누락 페이지·스캔 문항 여부를 확인해 주세요.")
+    warnings=file_warnings(exam_bytes,answer_bytes,exam_name,answer_name)
     correct = pd.DataFrame({q: responses[q].eq(key[q]["answer"]) for q in key})
     scores = sum(correct[q].astype(int) * key[q]["points"] for q in key)
     student_rows = []
@@ -150,7 +204,8 @@ def analyze(exam_bytes, answer_bytes, omr_bytes, omr_name):
                "top3_wrong": items[:3]}
     return {"summary": summary, "students": student_rows, "items": items,
             "questions": questions, "key": key, "responses": responses,
-            "correct": correct, "warnings": ["원본에 듣기 음원은 포함되어 있지 않습니다. 듣기 유사 문제는 새로운 대본으로 생성합니다."]}
+            "correct": correct, "warnings": warnings,
+            "file_check":{"문제지":len(questions),"정답표":len(key),"OMR":len(responses.columns)}}
 
 
 def chat_context(result):
@@ -158,7 +213,8 @@ def chat_context(result):
     worst = result["items"][0]
     return json.dumps({"summary": result["summary"], "students": result["students"],
                        "items": result["items"], "most_wrong_original": {
-                           "number": worst["number"], **result["questions"][worst["number"]]}}, ensure_ascii=False)
+                           "number": worst["number"], **{k:v for k,v in result["questions"][worst["number"]].items()
+                                                          if k != "image_url"}}}, ensure_ascii=False)
 
 
 def export_excel(result):
@@ -170,6 +226,7 @@ def export_excel(result):
                     ["최저점 학생", ", ".join(summary["lowest_students"])]]
     summary_rows += [[f"오답 상위 {i} 문항", f"{v['number']}번 ({v['wrong_count']}명)"]
                      for i, v in enumerate(summary["top3_wrong"], 1)]
+    summary_rows += [["파일 검사 주의",w] for w in result.get('warnings',[])]
     scores = pd.DataFrame({"학생명": [r["student"] for r in result["students"]],
                            "점수": [r["score"] for r in result["students"]]})
     answers = pd.DataFrame({"학생명": scores["학생명"]})
@@ -204,6 +261,10 @@ def export_excel(result):
                 sheet.column_dimensions[get_column_letter(i)].width = width
         for cell in writer.book["문항별 분석"]["E"][1:]:
             cell.number_format = "0.0%"
+        for row in writer.book["전체 성적 개요"].iter_rows(min_row=2):
+            if row[0].value == "파일 검사 주의":
+                row[1].alignment = Alignment(wrap_text=True, vertical="top")
+                writer.book["전체 성적 개요"].row_dimensions[row[0].row].height = max(45,15*((len(str(row[1].value))+29)//30))
         for row in [5, 6, 7]:
             writer.book["전체 성적 개요"].cell(row, 2).number_format = "0.00"
     return output.getvalue()
