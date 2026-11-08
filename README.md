@@ -2,7 +2,7 @@
 
 - 학번: 202432675
 - 이름: 김나린
-- 배포 URL: 
+- 배포 URL: https://test-agent-gachon.streamlit.app/
 
 ## 실행
 
